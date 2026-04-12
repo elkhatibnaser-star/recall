@@ -85,8 +85,10 @@ input,textarea,button{font-family:inherit;-webkit-appearance:none;appearance:non
 let state = {
   decks: [],
   appStats: { days: {} },
+  reviewLog: [],
+  tombstones: [],
   profile: { id: '', name: 'Learner', email: '', created: Date.now() },
-  settings: { dailyGoal: 20, newCardsPerSession: 20, reviewsPerSession: 100, buryAgainCards: true, keyboardShortcuts: true, updatedAt: Date.now() },
+  settings: { dailyGoal: 20, newCardsPerSession: 20, reviewsPerSession: 100, buryAgainCards: true, keyboardShortcuts: true, autoSync: true, updatedAt: Date.now() },
   sync: { enabled: false, provider: 'supabase', lastSync: null, deviceId: '', supabaseUrl: '', supabaseAnonKey: '', accessToken: '', refreshToken: '', userId: '', userEmail: '' },
   view: 'home',
   currentDeckId: null,
@@ -101,14 +103,20 @@ let state = {
 
 const COLORS = ['#6366f1','#ec4899','#14b8a6','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#84cc16'];
 let selectedColor = COLORS[0];
+let syncTimer = null;
+let syncInFlight = false;
+let suppressAutoSync = false;
 
 // STORAGE
 function save() {
   try { localStorage.setItem('recall-decks', JSON.stringify(state.decks)); } catch(e) {}
   try { localStorage.setItem('recall-stats', JSON.stringify(state.appStats)); } catch(e) {}
+  try { localStorage.setItem('recall-review-log', JSON.stringify(state.reviewLog)); } catch(e) {}
+  try { localStorage.setItem('recall-tombstones', JSON.stringify(state.tombstones)); } catch(e) {}
   try { localStorage.setItem('recall-profile', JSON.stringify(state.profile)); } catch(e) {}
   try { localStorage.setItem('recall-settings', JSON.stringify(state.settings)); } catch(e) {}
   try { localStorage.setItem('recall-sync', JSON.stringify(state.sync)); } catch(e) {}
+  scheduleAutoPush();
 }
 function load() {
   try {
@@ -118,6 +126,14 @@ function load() {
   try {
     const s = localStorage.getItem('recall-stats');
     if (s) state.appStats = normalizeStats(JSON.parse(s));
+  } catch(e) {}
+  try {
+    const log = localStorage.getItem('recall-review-log');
+    if (log) state.reviewLog = normalizeReviewLog(JSON.parse(log));
+  } catch(e) {}
+  try {
+    const tombstones = localStorage.getItem('recall-tombstones');
+    if (tombstones) state.tombstones = normalizeTombstones(JSON.parse(tombstones));
   } catch(e) {}
   try {
     const p = localStorage.getItem('recall-profile');
@@ -131,6 +147,7 @@ function load() {
     const sync = localStorage.getItem('recall-sync');
     state.sync = normalizeSync(sync ? JSON.parse(sync) : state.sync);
   } catch(e) { state.sync = normalizeSync(state.sync); }
+  state.appStats = deriveStatsFromReviewLog(state.reviewLog, state.appStats);
   save();
 }
 
@@ -161,7 +178,55 @@ function normalizeDecks(decks) {
 
 function normalizeStats(stats) {
   const days = stats && typeof stats.days === 'object' && stats.days ? stats.days : {};
-  return { days };
+  const normalizedDays = {};
+  Object.entries(days).forEach(([key, day]) => {
+    normalizedDays[key] = {
+      reviewed: Number(day.reviewed) || 0,
+      again: Number(day.again) || 0,
+      hard: Number(day.hard) || 0,
+      good: Number(day.good) || 0,
+      easy: Number(day.easy) || 0,
+      eventIds: Array.isArray(day.eventIds) ? day.eventIds.map(String) : [],
+    };
+  });
+  return { days: normalizedDays };
+}
+
+function normalizeReviewLog(log) {
+  if (!Array.isArray(log)) return [];
+  return log.map(event => ({
+    id: event.id || createId(),
+    cardId: String(event.cardId || ''),
+    deckId: String(event.deckId || ''),
+    quality: clampNumber(event.quality, 0, 3, 0),
+    reviewedAt: Number(event.reviewedAt) || Date.now(),
+    deviceId: String(event.deviceId || state.sync?.deviceId || ''),
+  })).filter(event => event.cardId && event.deckId);
+}
+
+function normalizeTombstones(tombstones) {
+  if (!Array.isArray(tombstones)) return [];
+  return tombstones.map(item => ({
+    id: String(item.id || ''),
+    type: item.type === 'deck' ? 'deck' : 'card',
+    parentId: item.parentId ? String(item.parentId) : null,
+    deletedAt: Number(item.deletedAt) || Date.now(),
+    deviceId: String(item.deviceId || state.sync?.deviceId || ''),
+  })).filter(item => item.id);
+}
+
+function deriveStatsFromReviewLog(log, fallback = { days: {} }) {
+  const stats = normalizeStats(fallback);
+  normalizeReviewLog(log).forEach(event => {
+    const key = dateKeyFromTimestamp(event.reviewedAt);
+    const day = stats.days[key] || { reviewed:0, again:0, hard:0, good:0, easy:0 };
+    if (day.eventIds?.includes(event.id)) return;
+    day.eventIds = [...(day.eventIds || []), event.id];
+    day.reviewed++;
+    day[['again','hard','good','easy'][event.quality]]++;
+    stats.days[key] = day;
+  });
+  return stats;
 }
 
 function normalizeProfile(profile) {
@@ -181,6 +246,7 @@ function normalizeSettings(settings) {
     reviewsPerSession: clampNumber(settings.reviewsPerSession, 1, 500, 100),
     buryAgainCards: settings.buryAgainCards !== false,
     keyboardShortcuts: settings.keyboardShortcuts !== false,
+    autoSync: settings.autoSync !== false,
     updatedAt: Number(settings.updatedAt) || Date.now(),
   };
 }
@@ -280,16 +346,32 @@ function getDeck() { return state.decks.find(d => d.id === state.currentDeckId);
 function todayKey(offset = 0) {
   const d = new Date();
   d.setDate(d.getDate() + offset);
+  return dateKeyFromTimestamp(d.getTime());
+}
+
+function dateKeyFromTimestamp(timestamp) {
+  const d = new Date(timestamp);
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
 }
 
-function recordDailyReview(quality) {
-  const key = todayKey();
+function recordDailyReview(quality, deckId, cardId) {
+  const reviewedAt = Date.now();
+  const event = {
+    id: createId(),
+    deckId,
+    cardId,
+    quality,
+    reviewedAt,
+    deviceId: state.sync.deviceId,
+  };
+  state.reviewLog.push(event);
+  const key = dateKeyFromTimestamp(reviewedAt);
   const day = state.appStats.days[key] || { reviewed:0, again:0, hard:0, good:0, easy:0 };
   const names = ['again','hard','good','easy'];
+  day.eventIds = [...(day.eventIds || []), event.id];
   day.reviewed++;
   day[names[quality]]++;
   state.appStats.days[key] = day;
@@ -322,6 +404,12 @@ function touchCard(deck, card) {
   touchDeck(deck);
 }
 
+function addTombstone(type, id, parentId = null) {
+  const deletedAt = Date.now();
+  state.tombstones = state.tombstones.filter(item => !(item.type === type && item.id === id));
+  state.tombstones.push({ id, type, parentId, deletedAt, deviceId: state.sync.deviceId });
+}
+
 function getSyncPayload() {
   return {
     version: 1,
@@ -329,6 +417,8 @@ function getSyncPayload() {
     profile: state.profile,
     settings: state.settings,
     appStats: state.appStats,
+    reviewLog: state.reviewLog,
+    tombstones: state.tombstones,
     decks: state.decks,
   };
 }
@@ -337,6 +427,8 @@ function applySyncPayload(payload) {
   const merged = mergeSyncPayload(getSyncPayload(), payload || {});
   state.decks = merged.decks;
   state.appStats = merged.appStats;
+  state.reviewLog = merged.reviewLog;
+  state.tombstones = merged.tombstones;
   state.profile = merged.profile;
   state.settings = merged.settings;
 }
@@ -344,17 +436,41 @@ function applySyncPayload(payload) {
 function mergeSyncPayload(localPayload, remotePayload) {
   const localProfile = normalizeProfile(localPayload.profile || state.profile);
   const remoteProfile = normalizeProfile(remotePayload.profile || localProfile);
-  return {
+  const merged = {
     version: Math.max(Number(localPayload.version) || 1, Number(remotePayload.version) || 1),
     profile: pickNewer(localProfile, remoteProfile),
     settings: pickNewerSettings(localPayload.settings, remotePayload.settings),
-    appStats: mergeStats(localPayload.appStats || {}, remotePayload.appStats || remotePayload.stats || {}),
-    decks: mergeDecks(localPayload.decks || [], remotePayload.decks || []),
+    reviewLog: mergeReviewLogs(localPayload.reviewLog || [], remotePayload.reviewLog || []),
+    tombstones: mergeTombstones(localPayload.tombstones || [], remotePayload.tombstones || []),
+    appStats: { days: {} },
+    decks: [],
   };
+  merged.decks = mergeDecks(localPayload.decks || [], remotePayload.decks || [], merged.tombstones);
+  merged.appStats = deriveStatsFromReviewLog(merged.reviewLog, mergeStats(localPayload.appStats || {}, remotePayload.appStats || remotePayload.stats || {}));
+  return merged;
 }
 
-function mergeDecks(localDecks, remoteDecks) {
+function mergeReviewLogs(localLog, remoteLog) {
   const map = new Map();
+  normalizeReviewLog(localLog).forEach(event => map.set(event.id, event));
+  normalizeReviewLog(remoteLog).forEach(event => map.set(event.id, event));
+  return [...map.values()].sort((a,b) => a.reviewedAt - b.reviewedAt);
+}
+
+function mergeTombstones(localTombstones, remoteTombstones) {
+  const map = new Map();
+  normalizeTombstones(localTombstones).forEach(item => map.set(`${item.type}:${item.id}`, item));
+  normalizeTombstones(remoteTombstones).forEach(item => {
+    const existing = map.get(`${item.type}:${item.id}`);
+    if (!existing || item.deletedAt > existing.deletedAt) map.set(`${item.type}:${item.id}`, item);
+  });
+  return [...map.values()].sort((a,b) => b.deletedAt - a.deletedAt);
+}
+
+function mergeDecks(localDecks, remoteDecks, tombstones = []) {
+  const map = new Map();
+  const deletedDecks = new Map(tombstones.filter(item => item.type === 'deck').map(item => [item.id, item.deletedAt]));
+  const deletedCards = new Map(tombstones.filter(item => item.type === 'card').map(item => [item.id, item.deletedAt]));
   normalizeDecks(localDecks).forEach(deck => map.set(deck.id, deck));
   normalizeDecks(remoteDecks).forEach(remoteDeck => {
     const localDeck = map.get(remoteDeck.id);
@@ -365,21 +481,27 @@ function mergeDecks(localDecks, remoteDecks) {
     const winner = pickNewer(localDeck, remoteDeck);
     map.set(remoteDeck.id, {
       ...winner,
-      cards: mergeCards(localDeck.cards, remoteDeck.cards),
+      cards: mergeCards(localDeck.cards, remoteDeck.cards, deletedCards),
       updatedAt: Math.max(Number(localDeck.updatedAt) || 0, Number(remoteDeck.updatedAt) || 0),
     });
   });
-  return [...map.values()].sort((a,b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  return [...map.values()].filter(deck => {
+    const deletedAt = deletedDecks.get(deck.id);
+    return !deletedAt || (Number(deck.updatedAt) || 0) > deletedAt;
+  }).sort((a,b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 }
 
-function mergeCards(localCards, remoteCards) {
+function mergeCards(localCards, remoteCards, deletedCards = new Map()) {
   const map = new Map();
   normalizeDecks([{ id:'tmp', name:'tmp', cards: localCards || [] }])[0].cards.forEach(card => map.set(card.id, card));
   normalizeDecks([{ id:'tmp', name:'tmp', cards: remoteCards || [] }])[0].cards.forEach(remoteCard => {
     const localCard = map.get(remoteCard.id);
     map.set(remoteCard.id, localCard ? pickNewer(localCard, remoteCard) : remoteCard);
   });
-  return [...map.values()].sort((a,b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  return [...map.values()].filter(card => {
+    const deletedAt = deletedCards.get(card.id);
+    return !deletedAt || (Number(card.updatedAt) || 0) > deletedAt;
+  }).sort((a,b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 }
 
 function mergeStats(localStats, remoteStats) {
@@ -388,12 +510,14 @@ function mergeStats(localStats, remoteStats) {
   const days = { ...local.days };
   Object.entries(remote.days).forEach(([key, remoteDay]) => {
     const localDay = days[key] || {};
+    const eventIds = [...new Set([...(localDay.eventIds || []), ...(remoteDay.eventIds || [])])];
     days[key] = {
       reviewed: Math.max(Number(localDay.reviewed) || 0, Number(remoteDay.reviewed) || 0),
       again: Math.max(Number(localDay.again) || 0, Number(remoteDay.again) || 0),
       hard: Math.max(Number(localDay.hard) || 0, Number(remoteDay.hard) || 0),
       good: Math.max(Number(localDay.good) || 0, Number(remoteDay.good) || 0),
       easy: Math.max(Number(localDay.easy) || 0, Number(remoteDay.easy) || 0),
+      eventIds,
     };
   });
   return { days };
@@ -426,6 +550,50 @@ function assertSyncReady(needsAuth = true) {
   if (needsAuth && !state.sync.accessToken) throw new Error('Sign in to Supabase first.');
 }
 
+function canAutoSync() {
+  return state.settings.autoSync && state.sync.enabled && state.sync.accessToken && state.sync.supabaseUrl && state.sync.supabaseAnonKey;
+}
+
+function scheduleAutoPush(delay = 2500) {
+  if (suppressAutoSync || !canAutoSync()) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(() => autoPushSync(), delay);
+}
+
+async function autoPushSync() {
+  if (!canAutoSync() || syncInFlight) return;
+  syncInFlight = true;
+  try {
+    await saveCloudState(getSyncPayload(), false);
+  } catch(e) {
+    console.warn('Auto sync push failed', e);
+  } finally {
+    syncInFlight = false;
+  }
+}
+
+async function autoPullSync() {
+  if (!canAutoSync() || syncInFlight) return;
+  syncInFlight = true;
+  try {
+    const rows = await supabaseRequest(`/rest/v1/recall_sync_state?select=payload,updated_at&user_id=eq.${encodeURIComponent(state.sync.userId)}&limit=1`);
+    if (rows && rows.length) {
+      suppressAutoSync = true;
+      applySyncPayload(rows[0].payload || {});
+      state.sync = normalizeSync({ ...state.sync, lastSync: Date.parse(rows[0].updated_at) || Date.now() });
+      save();
+      suppressAutoSync = false;
+      await saveCloudState(getSyncPayload(), false);
+      render();
+    }
+  } catch(e) {
+    console.warn('Auto sync pull failed', e);
+  } finally {
+    suppressAutoSync = false;
+    syncInFlight = false;
+  }
+}
+
 async function supabaseRequest(path, options = {}, needsAuth = true) {
   assertSyncReady(needsAuth);
   const base = state.sync.supabaseUrl.replace(/\/$/, '');
@@ -439,7 +607,7 @@ async function supabaseRequest(path, options = {}, needsAuth = true) {
   return data;
 }
 
-async function saveCloudState(payload) {
+async function saveCloudState(payload, triggerLocalSave = true) {
   await supabaseRequest('/rest/v1/recall_sync_state?on_conflict=user_id', {
     method: 'POST',
     headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
@@ -450,7 +618,12 @@ async function saveCloudState(payload) {
     }),
   });
   state.sync = normalizeSync({ ...state.sync, lastSync: Date.now() });
-  save();
+  if (triggerLocalSave) save();
+  else {
+    suppressAutoSync = true;
+    save();
+    suppressAutoSync = false;
+  }
 }
 
 // ICONS
@@ -637,6 +810,13 @@ function renderSettings() {
           <div style="font-size:12px;color:var(--text3);margin-top:4px">Space reveals. 1-4 grades the answer.</div>
         </div>
         <label class="switch"><input id="keyboardShortcuts" type="checkbox" ${state.settings.keyboardShortcuts ? 'checked' : ''}><span class="slider"></span></label>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div style="font-size:14px;font-weight:500">Auto sync</div>
+          <div style="font-size:12px;color:var(--text3);margin-top:4px">Pulls on open and pushes shortly after changes.</div>
+        </div>
+        <label class="switch"><input id="autoSync" type="checkbox" ${state.settings.autoSync ? 'checked' : ''}><span class="slider"></span></label>
       </div>
       <div class="setting-row">
         <div>
@@ -861,6 +1041,11 @@ window.addDeck = function() {
 
 window.deleteDeck = function(id) {
   if (!confirm('Delete this deck and all its cards?')) return;
+  const deck = state.decks.find(d => d.id === id);
+  if (deck) {
+    addTombstone('deck', deck.id);
+    deck.cards.forEach(card => addTombstone('card', card.id, deck.id));
+  }
   state.decks = state.decks.filter(d => d.id !== id);
   save();
   if (state.currentDeckId === id) { state.currentDeckId = null; state.view = 'home'; }
@@ -917,6 +1102,7 @@ window.deleteCard = function(cardId) {
   const deck = getDeck();
   if (!deck) return;
   if (!confirm('Delete this card?')) return;
+  addTombstone('card', cardId, deck.id);
   deck.cards = deck.cards.filter(c => c.id !== cardId);
   touchDeck(deck);
   save();
@@ -938,6 +1124,7 @@ window.saveSettings = function() {
     reviewsPerSession: document.getElementById('reviewsPerSession')?.value,
     buryAgainCards: document.getElementById('buryAgainCards')?.checked,
     keyboardShortcuts: document.getElementById('keyboardShortcuts')?.checked,
+    autoSync: document.getElementById('autoSync')?.checked,
     updatedAt: Date.now(),
   });
   state.sync = normalizeSync({
@@ -984,6 +1171,7 @@ async function authenticateSync(mode) {
     state.profile = normalizeProfile({ ...state.profile, email });
     save();
     alert(mode === 'signup' ? 'Account created. You are signed in.' : 'Signed in.');
+    autoPullSync();
     render();
   } catch(e) {
     alert(e.message || 'Could not sign in.');
@@ -997,6 +1185,7 @@ function saveSettingsFromFields(rerender = true) {
     reviewsPerSession: document.getElementById('reviewsPerSession')?.value,
     buryAgainCards: document.getElementById('buryAgainCards')?.checked,
     keyboardShortcuts: document.getElementById('keyboardShortcuts')?.checked,
+    autoSync: document.getElementById('autoSync')?.checked,
     updatedAt: Date.now(),
   });
   state.sync = normalizeSync({
@@ -1014,6 +1203,7 @@ function saveSettingsFromFields(rerender = true) {
 window.signUpSync = function() { authenticateSync('signup'); };
 window.signInSync = function() { authenticateSync('signin'); };
 window.signOutSync = function() {
+  clearTimeout(syncTimer);
   state.sync = normalizeSync({ ...state.sync, accessToken: '', refreshToken: '', userId: '' });
   save();
   render();
@@ -1088,7 +1278,7 @@ window.answerCard = function(quality) {
   const keys = ['again','hard','good','easy'];
   state.stats.reviewed++;
   state.stats[keys[quality]]++;
-  recordDailyReview(quality);
+  recordDailyReview(quality, deck.id, card.id);
   save();
 
   if (quality === 0 && state.settings.buryAgainCards) {
@@ -1131,6 +1321,8 @@ window.exportData = function() {
     exportedAt: new Date().toISOString(),
     decks: state.decks,
     appStats: state.appStats,
+    reviewLog: state.reviewLog,
+    tombstones: state.tombstones,
     profile: state.profile,
     settings: state.settings,
     sync: state.sync,
@@ -1157,6 +1349,9 @@ async function importData(event) {
     if (!confirm('Import this backup? It will replace the current decks on this device.')) return;
     state.decks = importedDecks;
     state.appStats = normalizeStats(parsed.appStats || parsed.stats || {});
+    state.reviewLog = normalizeReviewLog(parsed.reviewLog || []);
+    state.tombstones = normalizeTombstones(parsed.tombstones || []);
+    state.appStats = deriveStatsFromReviewLog(state.reviewLog, state.appStats);
     state.profile = normalizeProfile(parsed.profile || state.profile);
     state.settings = normalizeSettings(parsed.settings || state.settings);
     state.sync = normalizeSync(parsed.sync || state.sync);
@@ -1182,9 +1377,20 @@ document.addEventListener('keydown', e => {
   }
 });
 
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') autoPullSync();
+  else autoPushSync();
+});
+
+window.addEventListener('online', () => autoPullSync());
+window.addEventListener('beforeunload', () => {
+  if (canAutoSync()) autoPushSync();
+});
+
 // INIT
 load();
 render();
+setTimeout(() => autoPullSync(), 500);
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
