@@ -89,7 +89,7 @@ let state = {
   tombstones: [],
   profile: { id: '', name: 'Learner', email: '', created: Date.now() },
   settings: { dailyGoal: 20, newCardsPerSession: 20, reviewsPerSession: 100, buryAgainCards: true, keyboardShortcuts: true, autoSync: true, updatedAt: Date.now() },
-  sync: { enabled: false, provider: 'supabase', lastSync: null, deviceId: '', supabaseUrl: '', supabaseAnonKey: '', accessToken: '', refreshToken: '', userId: '', userEmail: '' },
+  sync: { enabled: false, provider: 'supabase', lastSync: null, pendingChanges: false, status: 'idle', lastError: '', deviceId: '', supabaseUrl: '', supabaseAnonKey: '', accessToken: '', refreshToken: '', userId: '', userEmail: '' },
   view: 'home',
   currentDeckId: null,
   reviewQueue: [],
@@ -116,6 +116,7 @@ function save() {
   try { localStorage.setItem('recall-profile', JSON.stringify(state.profile)); } catch(e) {}
   try { localStorage.setItem('recall-settings', JSON.stringify(state.settings)); } catch(e) {}
   try { localStorage.setItem('recall-sync', JSON.stringify(state.sync)); } catch(e) {}
+  markPendingChange();
   scheduleAutoPush();
 }
 function load() {
@@ -256,6 +257,9 @@ function normalizeSync(sync) {
     enabled: Boolean(sync.enabled),
     provider: sync.provider || 'supabase',
     lastSync: sync.lastSync ? Number(sync.lastSync) : null,
+    pendingChanges: Boolean(sync.pendingChanges),
+    status: sync.status || 'idle',
+    lastError: String(sync.lastError || ''),
     deviceId: sync.deviceId || createId(),
     supabaseUrl: String(sync.supabaseUrl || ''),
     supabaseAnonKey: String(sync.supabaseAnonKey || ''),
@@ -554,19 +558,38 @@ function canAutoSync() {
   return state.settings.autoSync && state.sync.enabled && state.sync.accessToken && state.sync.supabaseUrl && state.sync.supabaseAnonKey;
 }
 
+function markPendingChange() {
+  if (suppressAutoSync || !state.sync.enabled) return;
+  state.sync.pendingChanges = true;
+}
+
+function persistSyncOnly() {
+  try { localStorage.setItem('recall-sync', JSON.stringify(state.sync)); } catch(e) {}
+}
+
+function setSyncStatus(status, error = '') {
+  state.sync = normalizeSync({ ...state.sync, status, lastError: error });
+  persistSyncOnly();
+  if (state.view === 'profile') render();
+}
+
 function scheduleAutoPush(delay = 2500) {
   if (suppressAutoSync || !canAutoSync()) return;
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => autoPushSync(), delay);
+  syncTimer = setTimeout(() => autoSyncNow(), delay);
 }
 
-async function autoPushSync() {
+async function autoSyncNow() {
   if (!canAutoSync() || syncInFlight) return;
   syncInFlight = true;
   try {
+    setSyncStatus('syncing');
+    await mergeCloudIntoLocal(false);
     await saveCloudState(getSyncPayload(), false);
+    setSyncStatus('synced');
   } catch(e) {
-    console.warn('Auto sync push failed', e);
+    setSyncStatus('error', e.message || 'Auto sync failed.');
+    console.warn('Auto sync failed', e);
   } finally {
     syncInFlight = false;
   }
@@ -576,22 +599,32 @@ async function autoPullSync() {
   if (!canAutoSync() || syncInFlight) return;
   syncInFlight = true;
   try {
-    const rows = await supabaseRequest(`/rest/v1/recall_sync_state?select=payload,updated_at&user_id=eq.${encodeURIComponent(state.sync.userId)}&limit=1`);
-    if (rows && rows.length) {
-      suppressAutoSync = true;
-      applySyncPayload(rows[0].payload || {});
-      state.sync = normalizeSync({ ...state.sync, lastSync: Date.parse(rows[0].updated_at) || Date.now() });
-      save();
-      suppressAutoSync = false;
-      await saveCloudState(getSyncPayload(), false);
-      render();
-    }
+    setSyncStatus('syncing');
+    const hadCloudData = await mergeCloudIntoLocal(false);
+    if (hadCloudData || state.sync.pendingChanges) await saveCloudState(getSyncPayload(), false);
+    setSyncStatus('synced');
+    render();
   } catch(e) {
+    setSyncStatus('error', e.message || 'Auto sync pull failed.');
     console.warn('Auto sync pull failed', e);
   } finally {
     suppressAutoSync = false;
     syncInFlight = false;
   }
+}
+
+async function mergeCloudIntoLocal(confirmMissing = false) {
+  const rows = await supabaseRequest(`/rest/v1/recall_sync_state?select=payload,updated_at&user_id=eq.${encodeURIComponent(state.sync.userId)}&limit=1`);
+  if (!rows || !rows.length) {
+    if (confirmMissing) throw new Error('No cloud backup found for this account.');
+    return false;
+  }
+  suppressAutoSync = true;
+  applySyncPayload(rows[0].payload || {});
+  state.sync = normalizeSync({ ...state.sync, lastSync: Date.parse(rows[0].updated_at) || Date.now() });
+  save();
+  suppressAutoSync = false;
+  return true;
 }
 
 async function supabaseRequest(path, options = {}, needsAuth = true) {
@@ -617,7 +650,7 @@ async function saveCloudState(payload, triggerLocalSave = true) {
       updated_at: new Date().toISOString(),
     }),
   });
-  state.sync = normalizeSync({ ...state.sync, lastSync: Date.now() });
+  state.sync = normalizeSync({ ...state.sync, lastSync: Date.now(), pendingChanges: false, status: 'synced', lastError: '' });
   if (triggerLocalSave) save();
   else {
     suppressAutoSync = true;
@@ -732,6 +765,7 @@ function renderProfile() {
   const reviewed = Object.values(state.appStats.days).reduce((sum, day) => sum + (Number(day.reviewed) || 0), 0);
   const syncText = state.sync.accessToken ? `Signed in as ${esc(state.sync.userEmail || 'Supabase user')}` : state.sync.enabled ? 'Supabase configured' : 'Local only';
   const lastSync = state.sync.lastSync ? new Date(state.sync.lastSync).toLocaleString() : 'Never';
+  const syncStatus = state.sync.lastError ? state.sync.lastError : state.sync.pendingChanges ? 'Local changes waiting to sync' : state.sync.status === 'syncing' ? 'Syncing now' : state.sync.status === 'synced' ? 'Synced' : 'Idle';
 
   return `<div class="fade-in">
     <div class="header">
@@ -767,10 +801,12 @@ function renderProfile() {
           <span class="badge" style="background:${state.sync.accessToken ? '#052e16' : state.sync.enabled ? '#1e1b4b' : '#18181b'};color:${state.sync.accessToken ? '#86efac' : state.sync.enabled ? '#a5b4fc' : 'var(--text3)'}">${state.sync.accessToken ? 'signed in' : state.sync.enabled ? 'configured' : 'off'}</span>
         </div>
         <div style="font-size:12px;color:var(--text4);margin-top:12px">Last sync: ${esc(lastSync)}</div>
+        <div style="font-size:12px;color:${state.sync.lastError ? '#f87171' : 'var(--text3)'};margin-top:4px">Status: ${esc(syncStatus)}</div>
         <div style="font-size:12px;color:var(--text4);margin-top:4px">Device: ${esc(state.sync.deviceId.slice(0, 8))}</div>
         <div class="toolbar">
           <button class="btn" onclick="pushSync()">Push</button>
           <button class="btn" onclick="pullSync()">Pull</button>
+          <button class="btn" onclick="autoSyncNow()">Sync now</button>
         </div>
       </div>
     </div>
@@ -1212,10 +1248,12 @@ window.signOutSync = function() {
 window.pushSync = async function() {
   try {
     assertSyncReady(true);
+    setSyncStatus('syncing');
     await saveCloudState(getSyncPayload());
     alert('Pushed to Supabase.');
     render();
   } catch(e) {
+    setSyncStatus('error', e.message || 'Push failed.');
     alert(e.message || 'Push failed.');
   }
 };
@@ -1224,10 +1262,8 @@ window.pullSync = async function() {
   try {
     assertSyncReady(true);
     if (!confirm('Pull cloud data and merge it with this device? Newer decks and cards win when there is a conflict.')) return;
-    const rows = await supabaseRequest(`/rest/v1/recall_sync_state?select=payload,updated_at&user_id=eq.${encodeURIComponent(state.sync.userId)}&limit=1`);
-    if (!rows || !rows.length) throw new Error('No cloud backup found for this account.');
-    applySyncPayload(rows[0].payload || {});
-    state.sync = normalizeSync({ ...state.sync, lastSync: Date.parse(rows[0].updated_at) || Date.now() });
+    setSyncStatus('syncing');
+    await mergeCloudIntoLocal(true);
     state.currentDeckId = null;
     state.view = 'home';
     save();
@@ -1235,6 +1271,7 @@ window.pullSync = async function() {
     alert('Merged with Supabase.');
     render();
   } catch(e) {
+    setSyncStatus('error', e.message || 'Pull failed.');
     alert(e.message || 'Pull failed.');
   }
 };
@@ -1379,12 +1416,12 @@ document.addEventListener('keydown', e => {
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') autoPullSync();
-  else autoPushSync();
+  else autoSyncNow();
 });
 
 window.addEventListener('online', () => autoPullSync());
 window.addEventListener('beforeunload', () => {
-  if (canAutoSync()) autoPushSync();
+  if (canAutoSync()) autoSyncNow();
 });
 
 // INIT
